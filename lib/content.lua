@@ -554,7 +554,7 @@ function Content.save_chapter_epub(settings, book, chapter, xhtml, assets, css)
     return path
 end
 
-function Content.save_book_epub(settings, book, chapters, chapter_bodies, suffix, assets, css)
+function Content.save_book_epub(settings, book, chapters, chapter_bodies, suffix, assets, css, cover_data)
     local book_id = book.book_id or book.bookId
     local dir = settings.cache_dir .. "/" .. basename_safe(book_id)
     os.execute("mkdir -p " .. string.format("%q", dir))
@@ -571,6 +571,27 @@ function Content.save_book_epub(settings, book, chapters, chapter_bodies, suffix
         { name = "mimetype", data = "application/epub+zip" },
         { name = "META-INF/container.xml", data = [[<?xml version="1.0" encoding="utf-8"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>]] },
     }
+
+    local cover_meta = ""
+    if cover_data and #cover_data > 0 then
+        local ext, mime = media_type_for(cover_data)
+        local cover_img_href = "images/cover" .. ext
+        table.insert(entries, { name = "OEBPS/" .. cover_img_href, data = cover_data })
+        table.insert(manifest_items, [[<item id="cover-image" href="]] .. xml_escape(cover_img_href) .. [[" media-type="]] .. xml_escape(mime) .. [[" properties="cover-image"/>]])
+        table.insert(manifest_items, [[<item id="cover" href="text/cover.xhtml" media-type="application/xhtml+xml"/>]])
+        table.insert(spine_items, [[<itemref idref="cover"/>]])
+        local cover_xhtml = [[<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="zh-CN">
+<head><title>Cover</title>
+<style>html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;}img{display:block;width:100%;height:100%;object-fit:contain;}</style>
+</head>
+<body><img src="../]] .. xml_escape(cover_img_href) .. [[" alt="Cover"/></body>
+</html>]]
+        table.insert(entries, { name = "OEBPS/text/cover.xhtml", data = cover_xhtml })
+        cover_meta = '\n<meta name="cover" content="cover-image"/>'
+    end
+
     for asset_index, asset in ipairs(assets or {}) do
         table.insert(manifest_items, [[<item id="asset_]] .. tostring(asset_index) .. [[" href="]] .. xml_escape(asset.href) .. [[" media-type="]] .. xml_escape(asset.media_type) .. [["/>]])
         table.insert(entries, { name = "OEBPS/" .. asset.href, data = asset.data })
@@ -606,7 +627,7 @@ function Content.save_book_epub(settings, book, chapters, chapter_bodies, suffix
 <dc:publisher>WeRead</dc:publisher>
 <dc:source>]] .. xml_escape(WeRead.reader_url(book_id)) .. [[</dc:source>
 <dc:language>zh-CN</dc:language>
-<meta property="dcterms:modified">]] .. utc_modified() .. [[</meta>
+<meta property="dcterms:modified">]] .. utc_modified() .. [[</meta>]] .. cover_meta .. [[
 </metadata>
 <manifest>
 ]] .. table.concat(manifest_items, "\n") .. [[
@@ -894,6 +915,30 @@ function Content.fetch_chapter_epub(client, settings, book, chapter)
     book.chapter_idx = chapter.chapterIdx
     book.reader_url = book.reader_url or WeRead.reader_url(book_id)
     return path, chapter
+end
+
+function Content.fetch_single_chapter_content(client, settings, book, chapter, state)
+    state = state or {}
+    local xhtml = Content.fetch_chapter_xhtml(client, settings, book, chapter)
+    if not state.css then
+        state.css = Content.fetch_chapter_css(client, settings, book, chapter)
+    end
+    local chapter_assets = {}
+    local cache = settings:get("cache", {})
+    if cache.download_images then
+        state.used_asset_names = state.used_asset_names or {}
+        local tar_assets, src_map = Content.download_chapter_assets(client, book, chapter, state.used_asset_names)
+        for _, asset in ipairs(tar_assets) do
+            table.insert(chapter_assets, asset)
+        end
+        xhtml = Content.rewrite_image_sources(xhtml, src_map)
+        local inline_xhtml, inline_assets = Content.download_remote_images(client, xhtml, state.used_asset_names)
+        xhtml = inline_xhtml
+        for _, a in ipairs(inline_assets) do
+            table.insert(chapter_assets, a)
+        end
+    end
+    return xhtml, chapter_assets
 end
 
 function Content.fetch_chapters_epub(client, settings, book, chapters, options)

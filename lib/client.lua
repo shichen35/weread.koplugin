@@ -232,6 +232,10 @@ function Client:gateway(api_name, params)
     })
 end
 
+function Client:get_book_info(book_id)
+    return self:gateway("/book/info", { bookId = book_id })
+end
+
 function Client:get_progress(book_id)
     return self:gateway("/book/getprogress", { bookId = book_id })
 end

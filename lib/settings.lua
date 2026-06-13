@@ -23,6 +23,7 @@ local defaults = {
     },
     read_report = {
         enabled = false,
+        mode = "manual",
         book_id = "",
         book_title = "",
         interval_seconds = 30,
@@ -30,6 +31,9 @@ local defaults = {
     },
     advanced = {
         developer_logs = false,
+    },
+    shelf = {
+        sort_order = "time_desc",
     },
     config_loaded = false,
 }
@@ -140,6 +144,13 @@ function Settings:apply_config(config)
             end
         end
         self:set("read_report", rr)
+    end
+    if type(config.shelf) == "table" then
+        local shelf = self:get("shelf")
+        for key, value in pairs(config.shelf) do
+            shelf[key] = value
+        end
+        self:set("shelf", shelf)
     end
     self:set("config_loaded", true)
     self:flush()
