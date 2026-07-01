@@ -538,7 +538,6 @@ end
 function WeReadPlugin:showCacheManagement()
     local lfs = require("libs/libkoreader-lfs")
     local books = self.settings:get("books", {})
-    local cache_dir = self.settings.cache_dir
     local items = {}
     local entries = {}
     local seen_dirs = {}
@@ -592,21 +591,11 @@ function WeReadPlugin:showCacheManagement()
         })
     end
 
+    -- Only list plugin-owned entries tracked in the books table. Scanning the
+    -- filesystem would list unrelated subfolders when cache_dir is a user-selected
+    -- library directory, and deleting one would rm -rf a non-WeRead folder.
     for book_id, book in pairs(books) do
-        add_cache_entry(book_id, book.title, Content.book_cache_dir(self.settings, book_id))
-    end
-
-    local ok, iter, dir_obj = pcall(lfs.dir, cache_dir)
-    if ok then
-        for entry in iter, dir_obj do
-            if entry ~= "." and entry ~= ".." then
-                local path = cache_dir .. "/" .. entry
-                local attr = lfs.attributes(path)
-                if attr and attr.mode == "directory" then
-                    add_cache_entry(entry, entry, path)
-                end
-            end
-        end
+        add_cache_entry(book_id, book.title, Content.book_resolved_dir(self.settings, book_id, book))
     end
 
     table.sort(entries, function(a, b)
@@ -690,9 +679,9 @@ function WeReadPlugin:confirmClearBookCache(book_id, title)
 end
 
 function WeReadPlugin:clearBookCache(book_id)
-    local cache_dir = Content.book_cache_dir(self.settings, book_id)
-    os.execute("rm -rf " .. string.format("%q", cache_dir))
     local books = self.settings:get("books", {})
+    local cache_dir = Content.book_resolved_dir(self.settings, book_id, books[book_id])
+    os.execute("rm -rf " .. string.format("%q", cache_dir))
     if books[book_id] then
         books[book_id].cached_file = nil
         books[book_id].cached_chapters = nil
@@ -732,7 +721,7 @@ end
 function WeReadPlugin:clearAllCache()
     local books = self.settings:get("books", {})
     for book_id, book in pairs(books) do
-        os.execute("rm -rf " .. string.format("%q", Content.book_cache_dir(self.settings, book_id)))
+        os.execute("rm -rf " .. string.format("%q", Content.book_resolved_dir(self.settings, book_id, book)))
         book.cached_file = nil
         book.cached_chapters = nil
         book.mp_articles = nil
