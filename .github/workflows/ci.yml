@@ -15,17 +15,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Lua
+      - name: Install LuaJIT
         run: |
           sudo apt-get update
-          sudo apt-get install -y lua5.1
+          sudo apt-get install -y luajit
 
       - name: Lua syntax check
         run: |
           find . -name '*.lua' \
             -not -path './config.lua' \
             -not -path './.git/*' \
-            -print0 | xargs -0 -r -n1 luac -p
+            -print0 | while IFS= read -r -d '' file; do
+              luajit -b "$file" /tmp/luajit-check.out
+            done
 
       - name: Python syntax check
         run: |
