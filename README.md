@@ -39,19 +39,9 @@
 
 ## TODO
 
-- [ ] 阅读进度双向同步（KOReader 位置 ↔ 微信读书进度映射）
-- [ ] 当前书籍详情页（阅读中展示微信读书元数据）
-- [ ] 独立的标注/笔记浏览界面（书签、热门划线聚合查看；阅读时查看划线和想法已支持，见「功能 → 书籍」）
-
-## 贡献 / Contributing
-
-欢迎提交 issue 和 PR。提交前请阅读 [CONTRIBUTING.md](CONTRIBUTING.md)。
-
-Issues and PRs are welcome. Please read [CONTRIBUTING.md](CONTRIBUTING.md) before submitting.
-
-Bug 反馈请提供清晰的复现步骤或截图、KOReader 日志、插件版本和 KOReader 版本；PR 请说明解决的问题或新增的特性，并按模板填写测试方式和截图。
-
-For bug reports, include clear reproduction steps or screenshots, KOReader logs, plugin version, and KOReader version. For PRs, describe the problem fixed or feature added, and fill in the testing and screenshot sections in the template.
+- [ ] 阅读进度双向同步
+- [ ] 按需缓存章节
+- [ ] 书签/笔记
 
 ## 安装
 
@@ -80,31 +70,6 @@ koreader/plugins/weread.koplugin/
 3. 点击 **获取 API Key**，确认已经生成个人官方 API Key。
 4. 在 KOReader 打开 **工具 → 微信读书 → 微信扫码登录**。
 5. 使用微信扫码并在手机端确认；若手机显示四位验证码，请在 KOReader 中输入。
-
-插件会验证 Cookie、用户资料和个人 API Key，全部成功后才一次性保存到 KOReader 的 `settings/weread.lua`。如果登录接口没有返回 API Key，本次登录会失败且不会保存任何凭证；请先按上述步骤开通微信读书 Skill，再重新扫码。
-
-二维码以居中弹窗显示；点击二维码弹窗或按设备按键可主动取消本次登录。登录成功后，一级菜单会从“微信扫码登录”变为“已经登录 · 账号名”，只有清除账号数据后才恢复扫码入口。
-
-点击需要 Cookie 或 API Key 的功能时，如果尚未登录，插件会直接引导进入扫码登录。
-
-### 从旧版本升级
-
-认证数据带有独立的 schema 版本。首次启动本版本时，如果现有 `settings/weread.lua` 没有认证版本号，或版本号低于当前版本，插件会自动清除旧 Cookie（包括 refresh token）、API Key、公众号票据和旧账号信息，并要求重新扫码。书籍/章节缓存、下载记录、缓存目录以及其他用户偏好不会被清除。
-
-开发者可以使用不保存凭证的复现脚本验证同一协议：
-
-```bash
-pip install requests 'qrcode[pil]'
-python scripts/verify_qr_login.py --open-browser
-```
-
-### 凭证更新规则
-
-- 微信读书 Web 请求统一使用设置中保存的 Cookie；响应的 `Set-Cookie` 会自动合并并持久化。
-- `/web/login/renewal` 只有明确返回 `succ=1` 才视为续期成功，并持久化响应中的新 Cookie。
-- 实际验证确认：扫码接口和 `/web/login/renewal` 都不返回 `x-wr-ticket` 或 `x-wrpa-0`，因此扫码登录无法补齐这两个公众号专用请求头。
-- 公众号请求被拒绝时仍会自动续期 Cookie 并重试一次，但不能保证解决依赖公众号专用请求头的错误。
-- 完整扫码登录会替换旧 Cookie jar，并清除旧账号的公众号票据，避免跨账号残留。
 
 ## 菜单结构
 
@@ -166,3 +131,9 @@ weread.koplugin/
     ├── weread-api-reference.md      API 接口参考
     └── weread-content-research.md   内容解码研究
 ```
+
+## 贡献 
+
+欢迎提交 issue 和 PR。提交前请阅读 [CONTRIBUTING.md](CONTRIBUTING.md)。
+
+Bug 反馈请提供清晰的复现步骤或截图、KOReader 日志、插件版本和 KOReader 版本；PR 请说明解决的问题或新增的特性，并按模板填写测试方式和截图。

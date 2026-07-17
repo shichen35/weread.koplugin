@@ -72,6 +72,13 @@ local function is_timeout_error(err)
         or text:find("wantread", 1, true) ~= nil
 end
 
+local function sleep_seconds(seconds)
+    local ok_socket, socket = pcall(require, "socket")
+    if ok_socket and socket.sleep then
+        socket.sleep(seconds)
+    end
+end
+
 function QRLogin:new(host, client, settings)
     return setmetatable({
         host = host,
@@ -85,8 +92,9 @@ function QRLogin:new(host, client, settings)
     }, self)
 end
 
-function QRLogin:_request_json(url, opts)
+function QRLogin:_request_json(url, opts, stage)
     opts = opts or {}
+    stage = stage or "request"
     opts.url = url
     opts.skip_cookie = true
     local text, code, headers, status = self.client:request(opts)
@@ -94,7 +102,18 @@ function QRLogin:_request_json(url, opts)
         return nil, headers, status or "request failed"
     end
     if code < 200 or code >= 300 then
-        error("HTTP " .. tostring(code))
+        local request_headers = opts.headers or {}
+        local cookie_header = header_value(request_headers, "cookie")
+        local vid_header = header_value(request_headers, "x-vid")
+        local skey_header = header_value(request_headers, "x-skey")
+        logger.warn(
+            LOG_MODULE,
+            stage, "rejected:", "HTTP", tostring(code),
+            "cookie_bytes=", tostring(#tostring(cookie_header or "")),
+            "x_vid_bytes=", tostring(#tostring(vid_header or "")),
+            "x_skey_bytes=", tostring(#tostring(skey_header or ""))
+        )
+        error(stage .. " failed: HTTP " .. tostring(code))
     end
     local data = self.client:json_decode(text)
     if type(data) ~= "table" then
@@ -134,7 +153,7 @@ function QRLogin:_begin_protocol()
         method = "GET",
         timeout = { 10, 20 },
         headers = headers,
-    })
+    }, "getLoginUid")
     login_cookies = merge_response_cookies(login_cookies, response_headers)
     if type(data.uid) ~= "string" or data.uid == "" then
         error("WeRead did not return a valid login UID")
@@ -167,7 +186,7 @@ function QRLogin:_poll_protocol(uid, otp)
         method = "GET",
         timeout = { POLL_BLOCK_TIMEOUT_SECONDS, POLL_TOTAL_TIMEOUT_SECONDS },
         headers = headers,
-    })
+    }, "getLoginInfo")
     if not data then
         if is_timeout_error(request_error) or request_error == "request failed" then
             return { transport_pending = true }
@@ -178,19 +197,31 @@ function QRLogin:_poll_protocol(uid, otp)
     return data
 end
 
-function QRLogin:_authenticated_get(url, cookies, web_login_vid, access_token)
-    local data, response_headers = self:_request_json(url, {
-        method = "GET",
-        timeout = { 10, 20 },
-        headers = {
-            ["Accept"] = "application/json, text/plain, */*",
-            ["Referer"] = SKILLS_PAGE_URL,
-            ["Cookie"] = Cookie.to_header(cookies),
-            ["X-Vid"] = web_login_vid,
-            ["X-Skey"] = access_token,
-        },
-    })
-    return data, merge_response_cookies(cookies, response_headers)
+function QRLogin:_authenticated_get(url, cookies, web_login_vid, access_token, stage)
+    for attempt = 1, 3 do
+        local ok, data, response_headers = pcall(function()
+            return self:_request_json(url, {
+                method = "GET",
+                timeout = { 10, 20 },
+                headers = {
+                    ["Accept"] = "application/json, text/plain, */*",
+                    ["Referer"] = SKILLS_PAGE_URL,
+                    ["Cookie"] = Cookie.to_header(cookies),
+                    ["X-Vid"] = web_login_vid,
+                    ["X-Skey"] = access_token,
+                },
+            }, stage)
+        end)
+        if ok then
+            return data, merge_response_cookies(cookies, response_headers)
+        end
+        local retryable = tostring(data):find("HTTP 401", 1, true) ~= nil
+        if not retryable or attempt == 3 then
+            error(data)
+        end
+        logger.warn(LOG_MODULE, stage, "temporarily unauthorized; retrying:", tostring(attempt))
+        sleep_seconds(0.5)
+    end
 end
 
 function QRLogin:_complete_protocol(login_result, generation)
@@ -222,7 +253,8 @@ function QRLogin:_complete_protocol(login_result, generation)
         user_url,
         cookies,
         web_login_vid,
-        access_token
+        access_token,
+        "userInfo"
     )
 
     local api_result
@@ -232,17 +264,15 @@ function QRLogin:_complete_protocol(login_result, generation)
             API_KEY_URL,
             cookies,
             web_login_vid,
-            access_token
+            access_token,
+            "apikeyGet"
         )
         api_key = type(api_result.apikey) == "string" and api_result.apikey or ""
         if api_key ~= "" then
             break
         end
         if attempt < 3 then
-            local ok_socket, socket = pcall(require, "socket")
-            if ok_socket and socket.sleep then
-                socket.sleep(0.5)
-            end
+            sleep_seconds(0.5)
         end
     end
     if api_key == "" then
