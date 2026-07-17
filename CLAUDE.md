@@ -95,6 +95,7 @@ This applies to: content decoding, chapter downloading, image/resource packaging
 
 Existing reference scripts:
 - `scripts/fetch_weread_epub.py` — content decoding + EPUB generation reference
+- `scripts/verify_qr_login.py` — QR login, OTP, Cookie, user-info, API-key, and renewal-header verification
 - `scripts/verify_mp_articles.py` — MP article API verification
 
 Gateway (official skill) APIs can be called directly without script validation since they have stable, documented behavior.
@@ -102,14 +103,14 @@ Gateway (official skill) APIs can be called directly without script validation s
 ## Privacy / Security
 
 Never commit or log:
-- `config.lua` (gitignored)
+- KOReader `settings/weread.lua`
 - Real API keys (`wrk-...`), cookie values (`wr_skey`, `wr_rt`, `wr_vid`, etc.)
 - Anti-abuse headers (`x-wrpa-*`)
 - Generated EPUB/cache files
 
 Pre-commit scan:
 ```bash
-rg -n "wrk-|wr_skey[=]|wr_rt[=]|wr_vid[=]|ptcz[=]|x-wrpa|thirdwx" -S . --glob '!config.lua'
+rg -n "wrk-|wr_skey[=]|wr_rt[=]|wr_vid[=]|ptcz[=]|x-wrpa|thirdwx" -S .
 ```
 
 ## Unimplemented Features (WIP)

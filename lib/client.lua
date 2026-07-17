@@ -10,8 +10,6 @@ if not ok_json then
 end
 
 local DEFAULT_TIMEOUT_SECONDS = 15
-local unpack_args = unpack or table.unpack
-
 local Client = {}
 Client.__index = Client
 
@@ -110,6 +108,41 @@ local function is_weread_url(url)
     return host == "weread.qq.com" or host:sub(-#".weread.qq.com") == ".weread.qq.com"
 end
 
+local function absolute_url(base_url, location)
+    if type(location) ~= "string" or location == "" then
+        return nil
+    end
+    if location:match("^https?://") then
+        return location
+    end
+    local scheme, host = tostring(base_url or ""):match("^(https?)://([^/]+)")
+    if not scheme then
+        return location
+    end
+    if location:sub(1, 1) == "/" then
+        return scheme .. "://" .. host .. location
+    end
+    local prefix = base_url:match("^(https?://.*/)") or (scheme .. "://" .. host .. "/")
+    return prefix .. location
+end
+
+local function url_origin(url)
+    local scheme, authority = tostring(url or ""):match("^(https?)://([^/]+)")
+    if not scheme then
+        return nil
+    end
+    return scheme:lower() .. "://" .. authority:lower()
+end
+
+local function clear_cross_origin_headers(headers)
+    for key in pairs(headers or {}) do
+        local name = tostring(key):lower()
+        if name == "authorization" or name == "cookie" or name == "origin" then
+            headers[key] = nil
+        end
+    end
+end
+
 function Client:new(settings)
     return setmetatable({
         settings = settings,
@@ -157,6 +190,16 @@ function Client:request(opts)
     if body then
         headers["Content-Length"] = tostring(#body)
     end
+    local block_timeout = DEFAULT_TIMEOUT_SECONDS
+    local total_timeout = -1
+    if type(opts.timeout) == "table" and opts.timeout[1] then
+        block_timeout = opts.timeout[1]
+        total_timeout = opts.timeout[2] or block_timeout
+    elseif type(opts.timeout) == "number" then
+        block_timeout = opts.timeout
+    end
+    socketutil:set_timeout(block_timeout, total_timeout)
+
     local sink_to_use = opts.sink
     if not sink_to_use then
         response = {}
@@ -167,29 +210,71 @@ function Client:request(opts)
         method = body and "POST" or "GET",
         source = body and ltn12.source.string(body) or nil,
         sink = sink_to_use,
-        headers = headers
+        headers = headers,
     }, opts)
+    -- Redirects are handled explicitly by request_follow so credentials can be
+    -- rebuilt for every destination instead of being copied across origins.
+    req_opts.redirect = false
 
-    if type(opts.timeout) == "table" and opts.timeout[1] then
-        local t1 = opts.timeout[1]
-        local t2 = opts.timeout[2] or t1
-        socketutil:set_timeout(t1, t2)
+    local results = { pcall(http.request, req_opts) }
+    socketutil:reset_timeout()
+    if not results[1] then
+        error(results[2])
     end
-    
-    local _, code, resp_headers, status = http.request(req_opts)
-    if opts.timeout then socketutil:reset_timeout() end
+    local _, raw_code, resp_headers, status = results[2], results[3], results[4], results[5]
+    if status == nil and type(raw_code) == "string" then
+        status = raw_code
+    end
 
     if not opts.sink then response = table.concat(response) end
-    if is_handle_cookie then
+    if is_handle_cookie and opts.persist_response_cookies ~= false then
         local set_cookie = header_value(resp_headers, "set-cookie")
         if set_cookie then
-            local cookies = self.settings:get("cookies", {})
-            self.settings:set("cookies", Cookie.merge_set_cookie(cookies, set_cookie))
-            self.settings:flush()
+            self.settings:merge_set_cookie(set_cookie)
         end
     end
 
-    return response, tonumber(code), resp_headers or {}, status
+    return response, tonumber(raw_code), resp_headers or {}, status
+end
+
+function Client:request_follow(opts, max_redirects)
+    local request_opts = deepcopy(opts or {})
+    max_redirects = max_redirects or request_opts.maxredirects or 5
+    request_opts.maxredirects = nil
+    local url = request_opts.url
+
+    for _redirect_index = 0, max_redirects do
+        request_opts.url = url
+        local text, code, headers, status = self:request(request_opts)
+        local is_redirect = code == 301 or code == 302 or code == 303
+            or code == 307 or code == 308
+        if not is_redirect then
+            return text, code, headers, status, url
+        end
+
+        local next_url = absolute_url(url, header_value(headers, "location"))
+        if not next_url then
+            return text, code, headers, status, url
+        end
+        if url_origin(url) ~= url_origin(next_url) then
+            clear_cross_origin_headers(request_opts.headers)
+        end
+        if code == 303 or ((code == 301 or code == 302)
+            and request_opts.method ~= "GET" and request_opts.method ~= "HEAD") then
+            request_opts.method = "GET"
+            request_opts.body = nil
+            request_opts.source = nil
+            if request_opts.headers then
+                for key in pairs(request_opts.headers) do
+                    if tostring(key):lower() == "content-length" then
+                        request_opts.headers[key] = nil
+                    end
+                end
+            end
+        end
+        url = next_url
+    end
+    error("Too many redirects")
 end
 
 function Client:post_json(url, data, opts)
@@ -238,12 +323,17 @@ function Client:get_public_text(url, opts)
             ["Referer"] = header_value(opts.headers, "Referer") or opts.referer or "https://mp.weixin.qq.com/",
         }
     })
-    local text, code, resp_headers = self:get_text(url, req_opts)
+    local text, code, resp_headers, _status, final_url = self:request_follow(
+        merge_req_opts(req_opts, { url = url, method = "GET" })
+    )
+    if not code or code < 200 or code >= 300 then
+        error(http_error(self, code, text, resp_headers))
+    end
     return text, {
         code = code,
         content_type = header_value(resp_headers, "content-type"),
         length = #(text or ""),
-        url = url,
+        url = final_url or url,
     }
 end
 
@@ -256,28 +346,44 @@ function Client:get_binary(url, opts)
             ["Referer"] = header_value(opts.headers, "Referer") or opts.referer or "https://weread.qq.com/",
         }
     })
-    return self:get_text(url, req_opts)
+    local text, code, resp_headers = self:request_follow(
+        merge_req_opts(req_opts, { url = url, method = "GET" })
+    )
+    if code and code >= 200 and code < 300 then
+        return text, code, resp_headers
+    end
+    error(http_error(self, code, text, resp_headers))
 end
 
 function Client:renew_cookie()
     local result, code, resp_headers = self:post_json("https://weread.qq.com/web/login/renewal", {
         rq = "%2Fweb%2Fbook%2Fread",
         ql = false,
+    }, {
+        -- Do not persist renewal cookies until the response explicitly confirms
+        -- success; failed renewals must leave the current credential set intact.
+        persist_response_cookies = false,
     })
-    local changed = false
+    if not WeRead.is_success_response(result) then
+        error("Cookie renewal response did not include succ=1")
+    end
+    local updates = {}
+    local set_cookie = header_value(resp_headers, "set-cookie")
+    if set_cookie then
+        updates.cookies = Cookie.merge_set_cookie(
+            self.settings:get("cookies", {}),
+            set_cookie
+        )
+    end
     local wr_ticket = scalar_header_value(resp_headers, "x-wr-ticket")
     if wr_ticket and wr_ticket ~= "" then
-        self.settings:set("wr_ticket", wr_ticket)
-        changed = true
+        updates.wr_ticket = wr_ticket
     end
     local wr_wrpa = scalar_header_value(resp_headers, "x-wrpa-0")
     if wr_wrpa and wr_wrpa ~= "" then
-        self.settings:set("wr_wrpa", wr_wrpa)
-        changed = true
+        updates.wr_wrpa = wr_wrpa
     end
-    if changed then
-        self.settings:flush()
-    end
+    self.settings:update_auth(updates, { replace_cookies = true })
     return result, code, resp_headers
 end
 
@@ -383,95 +489,6 @@ function Client:report_read(payload, referer)
     return self:post_json("https://weread.qq.com/web/book/read", payload, {
         referer = referer or "https://weread.qq.com/",
     })
-end
-
-local SIMPLE_API_URL = "https://weread.qq.com/wrwebsimplenjlogic/api/%s?platform=desktop"
-local SIMPLE_LOGIN_HEADERS = {
-    ["Referer"] = "https://weread.qq.com/wrwebsimplenjlogic/login",
-    ["User-Agent"] = WeRead.SIMPLE_USER_AGENT,
-}
-local get_simple_api =function(method)
-    return string.format(SIMPLE_API_URL, method)
-end
-
-function Client:_report_kv(payload)
-    local url = get_simple_api("kvlog")
-    return self:post_json(url, payload, {
-        headers = SIMPLE_LOGIN_HEADERS,
-        timeout = {5, 8},
-    })
-end
-
-function Client:generate_cgi_key()
-    math.randomseed(os.time())
-    return tostring(math.random(100, 999))    
-end
-
-function Client:generate_wr_fp()
-    local device_id = G_reader_settings and G_reader_settings:readSetting("device_id") or ""
-    if type(device_id) ~= "string" or device_id == "" then
-        return tostring(math.random(100000000, 2147483647))
-    end
-    local h = 0
-    local MAX_UINT32 = 4294967296 -- 2^32
-    for i = 1, #device_id do
-        h = (h * 31 + string.byte(device_id, i)) % MAX_UINT32
-    end
-    return tostring(math.floor(h))
-end
-
-function Client:get_confirm_url()
-    local url = get_simple_api("getuid")
-    local text = self:get_text(url, {
-        headers = SIMPLE_LOGIN_HEADERS,
-        timeout = {5, 10},
-    })
-    self:_report_kv({
-        vid = 0,
-        itemNames = {
-            global = { "WebSimple_Enter" }
-        }
-    })
-    local res = self:json_decode(text)
-    if res and res.uid then
-        return {
-            url = string.format("https://weread.qq.com/web/confirm?pf=2&uid=%s", res.uid),
-            uid = res.uid
-        }
-    end
-    return res
-end
-
-function Client:get_login_info(uid, cgi_key)
-    local url = get_simple_api("getlogininfo")
-    local data = {
-        uid = uid,
-        cgiKey = tostring(cgi_key),
-    }
-    return self:post_json(url, data, {
-        headers = SIMPLE_LOGIN_HEADERS,
-        timeout = {5, 10},
-    })
-end
-
-function Client:web_login(payload)
-    local url = get_simple_api("weblogin")
-    return self:post_json(url, payload, {
-        headers = SIMPLE_LOGIN_HEADERS,
-        timeout = {5, 10},
-    })
-end
-
-function Client:get_user_info(user_vid)
-    local url = WeRead.user_info_url(user_vid)
-    local text = self:get_text(url, {headers = SIMPLE_LOGIN_HEADERS,timeout = {5, 10}})
-    return self:json_decode(text)
-end
-
-function Client:get_skills_key()
-    local url = WeRead.skills_key_url()
-    local text = self:get_text(url, {timeout = {5, 10}})
-    return self:json_decode(text)
 end
 
 function Client:get_chapter_underlines(book_id, chapter_uid)

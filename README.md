@@ -69,131 +69,51 @@ koreader/plugins/weread.koplugin/
 工具 → 微信读书
 ```
 
-## 配置
+## 登录与认证
 
-所有配置通过 `config.lua` 文件完成。首次使用：
+插件只支持微信扫码登录，不需要创建或维护配置文件。
+
+扫码前需要先为账号开通微信读书 Skill：
+
+1. 手机打开**微信读书 App**。
+2. 进入 **我 → 设置 → 微信读书 Skill**。
+3. 点击 **获取 API Key**，确认已经生成个人官方 API Key。
+4. 在 KOReader 打开 **工具 → 微信读书 → 微信扫码登录**。
+5. 使用微信扫码并在手机端确认；若手机显示四位验证码，请在 KOReader 中输入。
+
+插件会验证 Cookie、用户资料和个人 API Key，全部成功后才一次性保存到 KOReader 的 `settings/weread.lua`。如果登录接口没有返回 API Key，本次登录会失败且不会保存任何凭证；请先按上述步骤开通微信读书 Skill，再重新扫码。
+
+二维码以居中弹窗显示；点击二维码弹窗或按设备按键可主动取消本次登录。登录成功后，一级菜单会从“微信扫码登录”变为“已经登录 · 账号名”，只有清除账号数据后才恢复扫码入口。
+
+点击需要 Cookie 或 API Key 的功能时，如果尚未登录，插件会直接引导进入扫码登录。
+
+### 从旧版本升级
+
+认证数据带有独立的 schema 版本。首次启动本版本时，如果现有 `settings/weread.lua` 没有认证版本号，或版本号低于当前版本，插件会自动清除旧 Cookie（包括 refresh token）、API Key、公众号票据和旧账号信息，并要求重新扫码。书籍/章节缓存、下载记录、缓存目录以及其他用户偏好不会被清除。
+
+开发者可以使用不保存凭证的复现脚本验证同一协议：
 
 ```bash
-cp config.example.lua config.lua
+pip install requests 'qrcode[pil]'
+python scripts/verify_qr_login.py --open-browser
 ```
 
-在电脑上编辑 `config.lua`，然后将整个插件目录同步到设备。
+### 凭证更新规则
 
-插件启动时自动加载 `config.lua`，也可以在运行时通过 `设置 → 重新加载 config.lua` 热加载。
-
-### 自动配置（推荐）
-
-现代版微信读书会检测 DevTools 并强制报错，且 `wr_skey` 等关键 cookie 是 HttpOnly 的，无法通过 `document.cookie` 读取，因此手动复制 cURL 的方式越来越困难。本仓库附带 `scripts/setup_auth.py`，使用 Playwright + CDP 自动获取 cookie 与 `x-wrpa-0` 头：
-
-```bash
-# 安装依赖（首次）
-pip install playwright
-playwright install chromium
-
-# 扫码登录一次后，浏览器会话会自动持久化到 ~/.weread_koplugin_browser/
-python scripts/setup_auth.py
-```
-
-脚本会自动：
-
-1. 打开持久化浏览器，扫码登录微信读书（仅首次需要）
-2. 通过 CDP `Network.getAllCookies` 获取所有 cookie（含 HttpOnly 的 `wr_skey`、`wr_vid` 等）
-3. 拦截 `web/book/read` 请求获取 `x-wrpa-0` 头
-4. 把结果写入 `config.lua` 的 `curl`、`mp_curl`、`wr_wrpa` 字段
-
-Cookie 过期后再次运行同一命令即可刷新，无需重新扫码。若 `wr_skey` 已不再发放，插件会自动回退检查 `wr_gid` 作为登录凭证。
-
-### 手动配置
-
-如果不便运行 Playwright 脚本，仍可按下面的小节手工抓取 cURL。`config.lua` 中各字段的语义与脚本生成的版本完全一致。
-
-### 获取 API Key
-
-API Key 用于浏览书架、搜索书籍、读取进度。
-
-1. 手机打开**微信读书 App**
-2. 点击底部 **我** 标签
-3. 进入 **设置**
-4. 找到 **微信读书SKILL** **获取API Key** 并复制
-
-```lua
-api_key = "wrk-xxxxxxxxxxxxxxxxxxxxxxxx",
-```
-
-### 获取书籍 cURL（cookie + 上报 payload）
-
-`curl` 字段用于提取登录 cookie 和阅读上报所需的 payload 字段。
-
-1. 电脑浏览器打开 [weread.qq.com](https://weread.qq.com)
-2. 登录你的微信读书账号
-3. 打开**任意一本书**的阅读页面
-4. 按 **F12** 打开开发者工具，切换到 **Network（网络）** 标签
-5. 在网络请求列表中找到 `read` 请求（URL 包含 `/web/book/read`）
-6. 右键该请求 → **Copy as cURL (bash)**
-7. 粘贴到 `config.lua` 的 `curl` 字段
-
-```lua
-curl = [[
-curl 'https://weread.qq.com/web/book/read' \
-  -H 'accept: ...' \
-  -b '...' \
-  --data-raw '{...}'
-]],
-```
-
-> 如果找不到 `/web/book/read` 请求，在阅读页面等待 30 秒左右，它会自动发送阅读时长上报请求。
-
-### 获取公众号 cURL（x-wrpa-0 验证头）
-
-`mp_curl` 字段用于获取公众号文章列表所需的验证头。
-
-1. 电脑浏览器打开 [weread.qq.com](https://weread.qq.com)
-2. 进入**任意一个公众号**的文章列表页面
-3. **F12** → **Network**
-4. 找到 `articles` 请求（URL 包含 `/web/mp/articles`）
-5. 右键 → **Copy as cURL (bash)**
-6. 粘贴到 `config.lua` 的 `mp_curl` 字段
-
-```lua
-mp_curl = [[
-curl 'https://weread.qq.com/web/mp/articles?bookId=...' \
-  -H 'accept: ...' \
-  -b '...' \
-  -H 'x-wrpa-0: ...'
-]],
-```
-
-> `mp_curl` 里包含的 cookie 如果比 `curl` 里的更新，插件会自动使用更新的版本。
-
-### 配置项一览
-
-| 字段 | 用途 | 必填 |
-|------|------|------|
-| `api_key` | 书架、搜索、进度同步 | 推荐 |
-| `curl` | 登录 cookie + 阅读上报 payload | 推荐 |
-| `mp_curl` | 公众号文章列表（x-wrpa-0） | 读公众号时需要 |
-| `cookie` | 备选，仅在 curl 为空时使用 | 可选 |
-| `sync` | 进度同步行为 | 可选 |
-| `cache` | 图片/划线想法下载、缓存大小限制 | 可选 |
-| `read_report` | 阅读时间上报间隔 | 可选 |
-
-### Cookie 过期
-
-微信读书的 cookie 会定期过期。插件会尝试自动续期，但如果续期失败：
-
-- **自动方式**：重新运行 `python scripts/setup_auth.py`，脚本会自动刷新 cookie 并写回 `config.lua`，无需重新扫码。
-- **手动方式**：
-  1. 重新在浏览器中登录 weread.qq.com
-  2. 重新复制 cURL 到 `config.lua`
-  3. 在 KOReader 中：`设置 → 重新加载 config.lua`
+- 微信读书 Web 请求统一使用设置中保存的 Cookie；响应的 `Set-Cookie` 会自动合并并持久化。
+- `/web/login/renewal` 只有明确返回 `succ=1` 才视为续期成功，并持久化响应中的新 Cookie。
+- 实际验证确认：扫码接口和 `/web/login/renewal` 都不返回 `x-wr-ticket` 或 `x-wrpa-0`，因此扫码登录无法补齐这两个公众号专用请求头。
+- 公众号请求被拒绝时仍会自动续期 Cookie 并重试一次，但不能保证解决依赖公众号专用请求头的错误。
+- 完整扫码登录会替换旧 Cookie jar，并清除旧账号的公众号票据，避免跨账号残留。
 
 ## 菜单结构
 
 ```
 微信读书
+├── 微信扫码登录 / 已经登录 · 账号名
 ├── 同步进度           （阅读书籍时显示，开发中）
-├── 书籍详情           （阅读书籍时显示，开发中）
-├── 显示划线和想法     （阅读书籍时显示，开关，控制已下载书籍划线和想法的显隐）
+├── 书籍详情           （阅读微信读书缓存书籍时显示）
+├── 显示划线和想法     （阅读书籍时显示，开关）
 ├── 书架               书架浏览（书籍 + 公众号分类）
 ├── 搜索               搜索微信读书
 ├── 阅读时间上报        后台上报阅读时长
@@ -207,8 +127,6 @@ curl 'https://weread.qq.com/web/mp/articles?bookId=...' \
 │   ├── 缓存管理
 │   │   ├── 缓存清理
 │   │   └── 缓存目录
-│   ├── 重新加载 config.lua
-│   ├── 立即续期 Cookie
 │   ├── 进度管理
 │   │   ├── 打开时拉取进度（暂不可用）
 │   │   └── 关闭时上传进度（暂不可用）
@@ -218,6 +136,7 @@ curl 'https://weread.qq.com/web/mp/articles?bookId=...' \
 │   │   └── 划线和想法（默认关闭）
 │   └── 账号管理
 │       ├── 账号状态
+│       ├── 立即续期 Cookie
 │       └── 清除账号数据
 └── 关于
 ```
@@ -228,8 +147,6 @@ curl 'https://weread.qq.com/web/mp/articles?bookId=...' \
 weread.koplugin/
 ├── _meta.lua              插件元数据
 ├── main.lua               入口、UI、业务逻辑
-├── config.example.lua     配置模板
-├── config.lua             用户配置（git 忽略）
 ├── CLAUDE.md              开发规范
 ├── lib/
 │   ├── client.lua          HTTP 客户端
@@ -238,11 +155,12 @@ weread.koplugin/
 │   ├── crypto.lua          SHA-256、MD5
 │   ├── download_dialog.lua 下载进度对话框
 │   ├── i18n.lua            中文翻译
+│   ├── qr_login.lua        扫码登录协议、状态机与凭证保存
 │   ├── settings.lua        设置持久化
 │   └── weread.lua          微信读书协议工具
 ├── scripts/
 │   ├── fetch_weread_epub.py     EPUB 生成参考脚本
-│   ├── setup_auth.py            自动获取 cookie / x-wrpa-0 头并生成 config.lua
+│   ├── verify_qr_login.py       扫码登录协议验证（不保存凭证）
 │   └── verify_mp_articles.py    公众号 API 验证脚本
 └── docs/
     ├── weread-api-reference.md      API 接口参考

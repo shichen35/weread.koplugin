@@ -2,7 +2,6 @@ local BD = require("ui/bidi")
 local ButtonDialog = require("ui/widget/buttondialog")
 local ConfirmBox = require("ui/widget/confirmbox")
 local Dispatcher = require("dispatcher")
-local NetworkMgr = require("ui/network/manager")
 local DownloadDialog = require("lib.download_dialog")
 local Event = require("ui/event")
 local ProgressbarDialog = require("ui/widget/progressbardialog")
@@ -16,11 +15,11 @@ local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local T = require("ffi/util").template
 
-local Cookie = require("lib.cookie")
 local Client = require("lib.client")
 local Content = require("lib.content")
 local Crypto = require("lib.crypto")
 local I18n = require("lib.i18n")
+local QRLogin = require("lib.qr_login")
 local Settings = require("lib.settings")
 local Thoughts = require("lib.thoughts")
 local WeRead = require("lib.weread")
@@ -69,67 +68,17 @@ local function file_exists(path)
     return true
 end
 
-local function config_auth_fingerprint(config)
-    local parts = {}
-    for _, key in ipairs({ "curl", "cookie", "mp_curl", "wr_ticket", "wr_wrpa" }) do
-        local value = type(config[key]) == "string" and config[key] or ""
-        table.insert(parts, key .. ":" .. tostring(#value) .. ":" .. value)
-    end
-    return Crypto.sha256_hex(table.concat(parts, "\n"))
-end
-
-local function stable_config_value(value)
-    if type(value) ~= "table" then
-        return type(value) .. ":" .. tostring(value)
-    end
-    local keys = {}
-    for key in pairs(value) do
-        table.insert(keys, tostring(key))
-    end
-    table.sort(keys)
-    local parts = {}
-    for _, key in ipairs(keys) do
-        table.insert(parts, key .. "=" .. stable_config_value(value[key]))
-    end
-    return "{" .. table.concat(parts, ",") .. "}"
-end
-
-local function config_preferences_fingerprint(config)
-    local preferences = {
-        sync = config.sync,
-        cache = config.cache,
-        read_report = config.read_report,
-        shelf = config.shelf,
-    }
-    return Crypto.sha256_hex(stable_config_value(preferences))
-end
-
-local function merge_cookie_tables(current, updates)
-    current = current or {}
-    for key, value in pairs(updates or {}) do
-        current[key] = value
-    end
-    return current
-end
-
 local WeReadPlugin = WidgetContainer:extend{
     name = "weread",
     is_doc_only = false,
     version = "0.1.1",
 }
 
-local function plugin_dir()
-    local source = debug.getinfo(1, "S").source or ""
-    local path = source:match("^@(.+)$") or source
-    return path:match("^(.*)/[^/]+$") or "."
-end
-
 function WeReadPlugin:init()
     math.randomseed(os.time())
-    self.plugin_dir = plugin_dir()
     self.settings = Settings:new()
     self.client = Client:new(self.settings)
-    self:loadConfigFile("startup")
+    self.qr_login = QRLogin:new(self, self.client, self.settings)
     self:onDispatcherRegisterActions()
     self.ui.menu:registerToMainMenu(self)
     local rr = self.settings:get("read_report")
@@ -139,111 +88,6 @@ function WeReadPlugin:init()
     ThoughtPopup.init()
     self._reader_session_gen = 0
     logger.info(LOG_MODULE, "initialized:", "version=", self.version)
-end
-
-function WeReadPlugin:loadConfigFile(source)
-    source = source or "unknown"
-    self._config_error = nil
-    local config_path = (self.plugin_dir or plugin_dir()) .. "/config.lua"
-    local file = io.open(config_path, "r")
-    if not file then
-        logger.info(LOG_MODULE, "config.lua not found; using stored settings:", "source=", source)
-        return
-    end
-    file:close()
-
-    local ok, config = pcall(dofile, config_path)
-    if not ok then
-        self._config_error = tostring(config)
-        logger.warn(LOG_MODULE, "config.lua load failed:", "source=", source, log_error(config))
-        return
-    end
-    local preferences_fingerprint = config_preferences_fingerprint(config)
-    local stored_preferences_fingerprint = self.settings:get("config_preferences_fingerprint", "")
-    local apply_preferences = source == "manual_reload"
-        or preferences_fingerprint ~= stored_preferences_fingerprint
-    local applied, err = self.settings:apply_config(config, {
-        apply_preferences = apply_preferences,
-    })
-    if not applied then
-        self._config_error = err
-        logger.warn(LOG_MODULE, "config.lua apply failed:", "source=", source, log_error(err))
-        return
-    end
-    if apply_preferences then
-        self.settings:set("config_preferences_fingerprint", preferences_fingerprint)
-        logger.info(LOG_MODULE, "config preferences imported:", "source=", source)
-    else
-        logger.info(LOG_MODULE, "config preferences unchanged; using persisted settings")
-    end
-
-    local fingerprint = config_auth_fingerprint(config)
-    local stored_fingerprint = self.settings:get("config_auth_fingerprint", "")
-    local import_auth = source == "manual_reload" or fingerprint ~= stored_fingerprint
-    if import_auth then
-        local raw_cookie = ""
-        local curl_payload
-        local imported_cookies = self.settings:get("cookies", {})
-        if type(config.curl) == "string" and config.curl:match("%S") then
-            raw_cookie, curl_payload = Cookie.extract_from_curl(config.curl)
-        elseif type(config.cookie) == "string" and config.cookie:match("%S") then
-            raw_cookie = config.cookie
-        end
-
-        if raw_cookie and raw_cookie:match("%S") then
-            local cookies = Cookie.parse_cookie_header(raw_cookie)
-            if Cookie.has_login_cookie(cookies) then
-                imported_cookies = merge_cookie_tables(imported_cookies, cookies)
-            end
-        end
-
-        local mp_source = type(config.mp_curl) == "string" and config.mp_curl:match("%S")
-            and config.mp_curl or config.curl
-        if type(mp_source) == "string" then
-            local ticket = mp_source:match("%-H%s+['\"][Xx]%-[Ww][Rr]%-[Tt]icket:%s*(.-)['\"]")
-            if ticket and ticket ~= "" then
-                self.settings:set("wr_ticket", ticket)
-            end
-            local wrpa = mp_source:match("%-H%s+['\"][Xx]%-[Ww][Rr][Pp][Aa]%-0:%s*(.-)['\"]")
-            if wrpa and wrpa ~= "" then
-                self.settings:set("wr_wrpa", wrpa)
-            end
-        end
-        if type(config.wr_ticket) == "string" and config.wr_ticket:match("%S") then
-            self.settings:set("wr_ticket", config.wr_ticket)
-        end
-        if type(config.wr_wrpa) == "string" and config.wr_wrpa:match("%S") then
-            self.settings:set("wr_wrpa", config.wr_wrpa)
-        end
-        if type(config.mp_curl) == "string" and config.mp_curl:match("%S") then
-            local mp_cookie = Cookie.extract_from_curl(config.mp_curl)
-            if mp_cookie and mp_cookie:match("%S") then
-                local cookies = Cookie.parse_cookie_header(mp_cookie)
-                if Cookie.has_login_cookie(cookies) then
-                    imported_cookies = merge_cookie_tables(imported_cookies, cookies)
-                end
-            end
-        end
-
-        if Cookie.has_login_cookie(imported_cookies) then
-            self.settings:set("cookies", imported_cookies)
-        end
-
-        if curl_payload and curl_payload ~= "" then
-            local parsed_ok, payload = pcall(function()
-                return self.client:json_decode(curl_payload)
-            end)
-            if parsed_ok and type(payload) == "table" then
-                self.settings:set("curl_payload", payload)
-            end
-        end
-        self.settings:set("config_auth_fingerprint", fingerprint)
-        logger.info(LOG_MODULE, "config credentials imported:", "source=", source)
-    else
-        logger.info(LOG_MODULE, "config credentials unchanged; using persisted credentials")
-    end
-    self.settings:flush()
-    logger.info(LOG_MODULE, "config.lua loaded:", "source=", source)
 end
 
 function WeReadPlugin:onDispatcherRegisterActions()
@@ -289,6 +133,27 @@ end
 function WeReadPlugin:getMainMenuItems()
     local items = {
         {
+            text_func = function()
+                local account = self.settings:get("account", {})
+                if account.login_method == "qr" and tonumber(account.login_time or 0) > 0 then
+                    local name = type(account.name) == "string" and account.name or ""
+                    if name == "" then name = _("Unknown account") end
+                    return T(_("Logged in · %1"), name)
+                end
+                return _("QR code login")
+            end,
+            keep_menu_open = true,
+            callback = self:safeCallback(_("QR login"), function(touchmenu_instance)
+                self._login_menu_instance = touchmenu_instance
+                local account = self.settings:get("account", {})
+                if account.login_method == "qr" and tonumber(account.login_time or 0) > 0 then
+                    self:showAccountStatus()
+                else
+                    self.qr_login:start()
+                end
+            end),
+        },
+        {
             text = _("Bookshelf"),
             callback = self:safeCallback(_("Bookshelf"), function()
                 self:showBookshelf()
@@ -303,6 +168,9 @@ function WeReadPlugin:getMainMenuItems()
         {
             text = _("Reading time report"),
             sub_item_table_func = function()
+                if not self:requireLogin(true, true) then
+                    return {}
+                end
                 return self:getReadReportMenuItems()
             end,
         },
@@ -323,15 +191,17 @@ function WeReadPlugin:getMainMenuItems()
     }
 
     if self.ui.document then
-        table.insert(items, 1, {
+        table.insert(items, 2, {
             text = _("Sync progress now") .. "  (" .. _("WIP") .. ")",
             enabled_func = function() return false end,
         })
-        table.insert(items, 2, {
-            text = _("Book details") .. "  (" .. _("WIP") .. ")",
-            enabled_func = function() return false end,
-        })
         table.insert(items, 3, {
+            text = _("Book details"),
+            callback = self:safeCallback(_("Book details"), function()
+                self:showCurrentBookDetails()
+            end),
+        })
+        table.insert(items, 4, {
             text = _("Show underlines and thoughts"),
             checked_func = function()
                 return self.settings:get("cache").show_annotations ~= false
@@ -384,34 +254,6 @@ function WeReadPlugin:getSettingsMenuItems()
                     },
                 }
             end,
-        },
-        {
-            text = _("Reload config.lua"),
-            keep_menu_open = true,
-            callback = self:safeCallback(_("Reload config.lua"), function()
-                self:loadConfigFile("manual_reload")
-                if self._config_error then
-                    self:showInfo(T(_("config.lua error:\n%1"), self._config_error))
-                else
-                    self:showInfo(_("config.lua loaded."))
-                end
-            end),
-        },
-         {
-            text = _("QR code login"),
-            keep_menu_open = true,
-            callback = function()
-                UIManager:nextTick(function()
-                    self:showQRCodeLoginDialog()
-                end)
-            end,
-        },
-        {
-            text = _("Renew cookie now"),
-            keep_menu_open = true,
-            callback = self:safeCallback(_("Renew cookie now"), function()
-                self:renewCookieWithUI()
-            end),
         },
         {
             text = _("Progress management"),
@@ -526,6 +368,13 @@ function WeReadPlugin:getSettingsMenuItems()
                         text = _("Account status"),
                         callback = self:safeCallback(_("Account status"), function()
                             self:showAccountStatus()
+                        end),
+                    },
+                    {
+                        text = _("Renew cookie now"),
+                        keep_menu_open = true,
+                        callback = self:safeCallback(_("Renew cookie now"), function()
+                            self:renewCookieWithUI()
                         end),
                     },
                     {
@@ -1214,186 +1063,61 @@ function WeReadPlugin:showList(title, items, empty_text)
     return menu
 end
 
-function WeReadPlugin:showImportCookieDialog()
-    local dialog
-    dialog = InputDialog:new{
-        title = _("Import WeRead cookie or cURL"),
-        input = "",
-        input_type = "text",
-        description = _("Paste a raw Cookie header or a full cURL copied from /web/book/read."),
-        buttons = {
-            {
-                {
-                    text = _("Cancel"),
-                    id = "close",
-                    callback = self:safeCallback(_("Cancel"), function()
-                        UIManager:close(dialog)
-                    end),
-                },
-                {
-                    text = _("Save"),
-                    is_enter_default = true,
-                    callback = self:safeCallback(_("Save"), function()
-                        local input = dialog:getInputText()
-                        local cookie_header, curl_data = Cookie.extract_from_curl(input)
-                        local cookies = Cookie.parse_cookie_header(cookie_header)
-                        if not Cookie.has_login_cookie(cookies) then
-                            self:showInfo(_("Could not find a valid wr_skey cookie."))
-                            return
-                        end
-                        self.settings:set("cookies", cookies)
-                        if curl_data and curl_data ~= "" then
-                            local ok, payload = pcall(function()
-                                return self.client:json_decode(curl_data)
-                            end)
-                            if ok and type(payload) == "table" then
-                                self.settings:set("curl_payload", payload)
-                            end
-                        end
-                        self.settings:flush()
-                        UIManager:close(dialog)
-                        self:renewCookieWithUI()
-                    end),
-                },
-            },
-        },
-    }
-    self:showInputDialog(dialog)
+function WeReadPlugin:requireLogin(require_cookie, require_api_key)
+    local missing_cookie = require_cookie and not self.settings:is_cookie_configured()
+    local missing_api_key = require_api_key and not self.settings:is_api_configured()
+    if not missing_cookie and not missing_api_key then
+        return true
+    end
+    self:showTransientInfo(_("Please scan the QR code to log in first."), 2)
+    UIManager:scheduleIn(0.2, function()
+        self.qr_login:start()
+    end)
+    return false
 end
 
-function WeReadPlugin:showQRCodeLoginDialog()
-    if not NetworkMgr:isConnected() then
-        self:showInfo(_("No network connection. Please connect Wi-Fi and try again."))
-        return
-    end
-    local TIMEOUT_SECONDS = 300
-    local POLL_INTERVAL = 2
-            
-    local cookies = self.settings:get("cookies", {})
-    if not cookies.wr_fp then 
-        cookies.wr_fp = self.client:generate_wr_fp()
-        if not cookies.wr_scaleRatio then cookies.wr_scaleRatio = "1" end
-        self.settings:set("cookies", cookies)
-        self.settings:flush()
-    end
-
-    local ok_url, res = pcall(self.client.get_confirm_url, self.client)
-    if not ok_url or type(res) ~= "table" or not res.url or not res.uid then
-        logger.err(LOG_MODULE, "get_confirm_url failed:", res)
-        self:showInfo(_("Login failed."))
-        return
-    end
-
-    local uid = res.uid
-    logger.dbg(LOG_MODULE, "UID:", uid)
-
-    local QRMessage = require("ui/widget/qrmessage")
-    local Device = require("device")
-    local qr_closed = false
-    local login_qr = QRMessage:new{
-        text = res.url,
-        width = Device.screen:getWidth(),
-        height = Device.screen:getHeight(),
-        -- +1s show timeout msg
-        timeout = TIMEOUT_SECONDS + 1,
-        dismiss_callback =function()
-            qr_closed = true
-            logger.dbg(LOG_MODULE, "QRMessage dismiss_callback")
-        end,
-        scale_factor = 0.8,
-    }
-
-    local cgi_key = self.client:generate_cgi_key()
-    local function perform_web_login(ret)
-        local current_cookies = self.settings:get("cookies", {})
-        local fp = current_cookies.wr_fp or self.client:generate_wr_fp()
-        local payload = {
-            vid = ret.vid,
-            skey = ret.skey,
-            code = ret.code,
-            isAutoLogout = 0,
-            pf = 2, cgiKey = cgi_key, fp = fp,
-        }
-        local ok_login, login_res = pcall(self.client.web_login, self.client, payload)
-        local has_login = self.settings:is_cookie_configured()
-
-        if not (ok_login and has_login) then
-            logger.err(LOG_MODULE, "Weblogin failed: ok =", ok_login, "has_login =", has_login, "error =", tostring(login_res))
-            self:showInfo(_("Login failed."))
-            return
-        end
-        logger.dbg(LOG_MODULE, "Login QR success")
-
-        local ok_user, user_info = pcall(self.client.get_user_info, self.client, ret.vid)
-        local msg = _("Login successful.")
-        if ok_user and type(user_info) == "table" then
-            msg = string.format("%s \n %s_%s", msg, 
-                user_info.location or _("Unknown"), 
-                user_info.name or _("Unknown")
-            )
-        else
-            logger.warn(LOG_MODULE, "test get_user_info failed:", tostring(user_info))
-        end
-        self:showInfo(msg)
-
-        if not self.settings:is_api_configured() then
-            local fetch_success, api_response = pcall(self.client.get_skills_key, self.client)
-            if fetch_success and type(api_response) == "table" and api_response.apikey then
-                self.settings:set("api_key", api_response.apikey)
-                self.settings:flush()
-            end
+function WeReadPlugin:refreshLoginMenu()
+    local menu = self._login_menu_instance
+    if menu and type(menu.updateItems) == "function" then
+        local ok, err = pcall(function()
+            menu:updateItems()
+        end)
+        if not ok then
+            logger.warn(LOG_MODULE, "refresh login menu failed:", log_error(err))
         end
     end
-
-    local poll_getinfo, start_time
-    poll_getinfo = function()
-        if qr_closed or not UIManager:isWidgetShown(login_qr) then
-            logger.dbg(LOG_MODULE, "Login QR quit, poll_getinfo exit")
-            return 
-        end
-        if os.time() - start_time > TIMEOUT_SECONDS then
-            qr_closed = true
-            UIManager:close(login_qr)
-            self:showInfo(_("Login timeout."))
-            return
-        end
-        local ok, ret = pcall(self.client.get_login_info, self.client, uid, cgi_key)
-        if not (ok and type(ret) == "table" and ret.vid and ret.skey and ret.code) then
-            logger.dbg(LOG_MODULE, "QR code Waiting for scan...") 
-            UIManager:scheduleIn(POLL_INTERVAL, poll_getinfo)
-            return
-        end
-        logger.info(LOG_MODULE, "QR code scanned and confirmed. Logging in...")
-        UIManager:close(login_qr)
-        perform_web_login(ret) 
-    end
-    UIManager:show(login_qr)
-    UIManager:nextTick(function()
-        start_time = os.time()
-        poll_getinfo() 
-    end)
+    self:refreshUI()
 end
 
 function WeReadPlugin:renewCookieWithUI()
-    if not self.settings:is_cookie_configured() then
-        self:showInfo(_("Cookie is not configured."))
+    if not self:requireLogin(true, false) then
         return
     end
     self:runNetworkAction(_("Renew cookie"), function()
-        local result = self.client:renew_cookie()
-        if result and result.succ then
-            logger.info(LOG_MODULE, "cookie renewed")
-            return _("WeRead cookie renewed.")
-        end
-        logger.warn(LOG_MODULE, "cookie renewal completed without succ=1")
-        return _("Cookie renewal completed, but response did not include succ=1.")
+        self.client:renew_cookie()
+        logger.info(LOG_MODULE, "cookie renewed")
+        return _("WeRead cookie renewed.")
     end)
 end
 
 function WeReadPlugin:showAccountStatus()
+    local account = self.settings:get("account", {})
+    local account_name = type(account.name) == "string" and account.name or ""
+    if account_name == "" then
+        account_name = (self.settings:is_cookie_configured() or self.settings:is_api_configured())
+            and _("Unknown account") or _("Not logged in")
+    end
+    local login_method = account.login_method == "qr" and _("QR login") or _("Unknown")
     local cookie_status = self.settings:is_cookie_configured() and _("configured") or _("missing")
     local api_status = self.settings:is_api_configured() and _("configured") or _("missing")
-    self:showInfo(T(_("Cookie: %1\nOfficial API key: %2\nCache directory:\n%3"), cookie_status, api_status, BD.dirpath(self.settings.cache_dir)))
+    self:showInfo(T(
+        _("Account: %1\nLogin method: %2\nCookie: %3\nOfficial API key: %4\nCache directory:\n%5"),
+        account_name,
+        login_method,
+        cookie_status,
+        api_status,
+        BD.dirpath(self.settings.cache_dir)
+    ))
 end
 
 function WeReadPlugin:confirmClearAccount()
@@ -1401,7 +1125,9 @@ function WeReadPlugin:confirmClearAccount()
         text = _("Clear WeRead cookie and API key? Cached books will remain."),
         ok_text = _("Clear"),
         ok_callback = self:safeCallback(_("Clear"), function()
+            self.qr_login:cancel()
             self.settings:reset_account()
+            self:refreshLoginMenu()
             self:showInfo(_("WeRead account data cleared."))
         end),
     })
@@ -1537,6 +1263,15 @@ function WeReadPlugin:detectWeReadBook()
     if not file then
         return nil
     end
+    local books = self.settings:get("books", {})
+    for book_id, book in pairs(books) do
+        if type(book) == "table" then
+            local dir = Content.book_resolved_dir(self.settings, book_id, book):gsub("/+$", "") .. "/"
+            if file == book.cached_file or file:sub(1, #dir) == dir then
+                return book_id
+            end
+        end
+    end
     -- Require a path boundary after the cache dir
     local prefix = self.settings.cache_dir:gsub("/+$", "") .. "/"
     if file:sub(1, #prefix) == prefix then
@@ -1548,8 +1283,7 @@ function WeReadPlugin:detectWeReadBook()
 end
 
 function WeReadPlugin:showReadReportBookPicker()
-    if not self.settings:is_api_configured() then
-        self:showInfo(_("Set the official API key to browse your WeRead shelf. You can still open a book by pasting a reader URL."))
+    if not self:requireLogin(true, true) then
         return
     end
     self:showBusy(_("Loading bookshelf..."))
@@ -1602,8 +1336,7 @@ function WeReadPlugin:showReadReportBookPicker()
 end
 
 function WeReadPlugin:showBookshelf()
-    if not self.settings:is_api_configured() then
-        self:showInfo(_("Set the official API key to browse your WeRead shelf. You can still open a book by pasting a reader URL."))
+    if not self:requireLogin(true, true) then
         return
     end
     self:showBusy(_("Loading bookshelf..."))
@@ -1732,6 +1465,9 @@ function WeReadPlugin:refreshShelfCacheIndicators()
 end
 
 function WeReadPlugin:showBookRecord(book)
+    if not self:requireLogin(true, true) then
+        return
+    end
     local books = self.settings:get("books", {})
     local book_id = book.book_id or book.bookId
     if WeRead.is_mp_book(book_id) then
@@ -1930,8 +1666,7 @@ end
 
 function WeReadPlugin:showMPAccount(book)
     self:rememberMPAccount(book)
-    if not self.settings:is_cookie_configured() then
-        self:showInfo(_("Import cookie/cURL before loading articles."))
+    if not self:requireLogin(true, false) then
         return
     end
     local book_id = book.book_id or book.bookId
@@ -1940,7 +1675,7 @@ function WeReadPlugin:showMPAccount(book)
         self:showMPArticleList(book, cached)
         return
     end
-    self:fetchMPArticles(book, nil)
+    self:fetchMPArticles(book)
 end
 
 function WeReadPlugin:rememberMPAccount(book)
@@ -1963,15 +1698,28 @@ function WeReadPlugin:rememberMPAccount(book)
     self.settings:flush()
 end
 
-function WeReadPlugin:fetchMPArticles(book, wr_ticket)
+function WeReadPlugin:fetchMPArticles(book)
+    if not self:requireLogin(true, false) then
+        return
+    end
     self:runOnlineTask(_("Loading articles..."), function()
         self:showBusy(_("Loading articles..."))
         local book_id = book.book_id or book.bookId
-        local ticket = wr_ticket or self.settings:get("wr_ticket", "")
-        if ticket == "" then ticket = nil end
-        local ok, result, err_code = pcall(function()
+        local function request_articles()
+            local ticket = self.settings:get("wr_ticket", "")
+            if ticket == "" then ticket = nil end
             return self.client:get_mp_articles(book_id, 0, 100, ticket)
-        end)
+        end
+        local ok, result, err_code = pcall(request_articles)
+        if ok and not result and (err_code == -2041 or err_code == -2012) then
+            logger.info(LOG_MODULE, "MP credentials rejected; renewing before retry")
+            local renew_ok = pcall(function()
+                return self.client:renew_cookie()
+            end)
+            if renew_ok then
+                ok, result, err_code = pcall(request_articles)
+            end
+        end
         self:closeBusy()
         if not ok then
             logger.err(LOG_MODULE, "load MP articles failed:", log_error(result))
@@ -1980,12 +1728,7 @@ function WeReadPlugin:fetchMPArticles(book, wr_ticket)
         end
         if not result and (err_code == -2041 or err_code == -2012) then
             logger.warn(LOG_MODULE, "load MP articles rejected, error_code:", tostring(err_code))
-            local saved_ticket = self.settings:get("wr_ticket", "")
-            if saved_ticket ~= "" then
-                self:showInfo(T(_("Load articles failed:\n%1"), "wr_ticket expired, update wr_ticket in config.lua"))
-            else
-                self:showInfo(_("MP articles require wr_ticket. Set wr_ticket in config.lua, then reload config."))
-            end
+            self:showInfo(_("WeRead could not refresh the public-account credential. Please scan the QR code again."))
             return
         end
         if not result then
@@ -1997,62 +1740,6 @@ function WeReadPlugin:fetchMPArticles(book, wr_ticket)
         self:cacheMPArticles(book_id, articles)
         self:showMPArticleList(book, articles)
     end)
-end
-
-function WeReadPlugin:showWrTicketDialog(book)
-    local dialog
-    dialog = InputDialog:new{
-        title = _("Provide x-wr-ticket"),
-        input = self.settings:get("wr_ticket", ""),
-        input_type = "text",
-        description = _("MP article list requires a browser token.\n\n1. Open weread.qq.com in a browser\n2. Open an MP account page\n3. Open DevTools (F12) → Network tab\n4. Find the /web/mp/articles request\n5. Copy the x-wr-ticket header value\n\nPaste it here (or paste the full cURL):"),
-        buttons = {
-            {
-                {
-                    text = _("Cancel"),
-                    id = "close",
-                    callback = self:safeCallback(_("Cancel"), function()
-                        UIManager:close(dialog)
-                    end),
-                },
-                {
-                    text = _("Fetch"),
-                    is_enter_default = true,
-                    callback = self:safeCallback(_("Fetch"), function()
-                        local input = dialog:getInputText()
-                        UIManager:close(dialog)
-                        local ticket = input
-                        local extracted = input:match("%-H%s+['\"][Xx]%-[Ww][Rr]%-[Tt]icket:%s*(.-)['\"]")
-                        if extracted then
-                            ticket = extracted
-                        elseif input:match("^%s*curl%s") then
-                            ticket = nil
-                        end
-                        if not ticket or ticket == "" then
-                            self:showInfo(_("No ticket provided."))
-                            return
-                        end
-                        self.settings:set("wr_ticket", ticket)
-                        local wrpa = input:match("%-H%s+['\"][Xx]%-[Ww][Rr][Pp][Aa]%-0:%s*(.-)['\"]")
-                        if wrpa and wrpa ~= "" then
-                            self.settings:set("wr_wrpa", wrpa)
-                        end
-                        local raw_cookie = Cookie.extract_from_curl(input)
-                        local cookies = Cookie.parse_cookie_header(raw_cookie)
-                        if Cookie.has_login_cookie(cookies) then
-                            self.settings:set(
-                                "cookies",
-                                merge_cookie_tables(self.settings:get("cookies", {}), cookies)
-                            )
-                        end
-                        self.settings:flush()
-                        self:fetchMPArticles(book, ticket)
-                    end),
-                },
-            },
-        },
-    }
-    self:showInputDialog(dialog)
 end
 
 function WeReadPlugin:getCachedMPArticles(book_id)
@@ -2098,15 +1785,14 @@ function WeReadPlugin:showMPArticleList(book, articles)
     table.insert(items, {
         text = _("Refresh article list"),
         callback = self:safeCallback(_("Refresh article list"), function()
-            self:showWrTicketDialog(book)
+            self:fetchMPArticles(book)
         end),
     })
     self:showList(book.title or _("Public Account"), items, _("No articles."))
 end
 
 function WeReadPlugin:downloadMPArticleAndRead(book, article)
-    if not self.settings:is_cookie_configured() then
-        self:showInfo(_("Import cookie/cURL before downloading articles."))
+    if not self:requireLogin(true, false) then
         return
     end
     self:runOnlineTask(_("Download article and read"), function()
@@ -2163,8 +1849,7 @@ function WeReadPlugin:loadChapters(book, callback)
         callback(book.chapters)
         return
     end
-    if not self.settings:is_cookie_configured() then
-        self:showInfo(_("Import cookie/cURL before loading chapters."))
+    if not self:requireLogin(true, false) then
         return
     end
     self:runOnlineTask(_("Loading chapter list..."), function()
@@ -2247,8 +1932,7 @@ function WeReadPlugin:downloadChapterAndRead(book, chapter)
 end
 
 function WeReadPlugin:downloadFirstNChapters(book, count)
-    if not self.settings:is_cookie_configured() then
-        self:showInfo(_("Import cookie/cURL before downloading book content."))
+    if not self:requireLogin(true, false) then
         return
     end
     self:loadChapters(book, function(chapters)
@@ -2301,8 +1985,7 @@ end
 
 function WeReadPlugin:downloadChaptersAsBook(book, chapters, suffix, options)
     options = options or {}
-    if not self.settings:is_cookie_configured() then
-        self:showInfo(_("Import cookie/cURL before downloading book content."))
+    if not self:requireLogin(true, false) then
         return
     end
     local task_label = options.single_chapter and _("Download chapter and read") or _("Download full book")
@@ -2676,6 +2359,9 @@ function WeReadPlugin:_downloadStep(dl)
 end
 
 function WeReadPlugin:pullProgressWithUI(book_id)
+    if not self:requireLogin(true, true) then
+        return
+    end
     self:runNetworkAction(_("Pull progress"), function()
         local result = self.client:get_progress(book_id)
         local progress = result and result.book and result.book.progress or 0
@@ -2684,8 +2370,7 @@ function WeReadPlugin:pullProgressWithUI(book_id)
 end
 
 function WeReadPlugin:showSearch()
-    if not self.settings:is_api_configured() then
-        self:showInfo(_("Set the official API key before using WeRead search."))
+    if not self:requireLogin(true, true) then
         return
     end
     local dialog
@@ -2782,8 +2467,7 @@ function WeReadPlugin:showPasteReaderURL()
 end
 
 function WeReadPlugin:parseReaderURLWithUI(url)
-    if not self.settings:is_cookie_configured() then
-        self:showInfo(_("Import cookie/cURL before parsing reader URLs."))
+    if not self:requireLogin(true, false) then
         return
     end
     self:runNetworkAction(_("Parse reader URL"), function()
@@ -2814,7 +2498,17 @@ end
 
 
 function WeReadPlugin:showCurrentBookDetails()
-    self:showInfo(_("Current-book WeRead metadata is not linked yet. Open a parsed WeRead book from the plugin cache first."))
+    if not self:requireLogin(true, true) then
+        return
+    end
+    local book_id = self:detectWeReadBook()
+    local book = book_id and self.settings:get("books", {})[book_id] or nil
+    if not book then
+        self:showInfo(_("The current document is not a WeRead cached book."))
+        return
+    end
+    book.book_id = book.book_id or book_id
+    self:showBookRecord(book)
 end
 
 function WeReadPlugin:onShowWeRead()
@@ -2822,6 +2516,9 @@ function WeReadPlugin:onShowWeRead()
 end
 
 function WeReadPlugin:onWeReadSyncProgress()
+    if not self:requireLogin(true, false) then
+        return
+    end
     local books = self.settings:get("books", {})
     local book_id, book
     for id, item in pairs(books) do
@@ -2839,9 +2536,9 @@ function WeReadPlugin:onWeReadSyncProgress()
         chapter_offset = book.chapter_offset or 0,
         progress = book.progress or 0,
         summary = book.summary or "",
-        app_id = book.app_id or self.settings:get("curl_payload", {}).appId,
-        psvts = book.psvts or self.settings:get("curl_payload", {}).ps,
-        pclts = book.pclts or self.settings:get("curl_payload", {}).pc,
+        app_id = book.app_id,
+        psvts = book.psvts,
+        pclts = book.pclts,
         token = book.token,
     }
     UIManager:show(ConfirmBox:new{
@@ -3325,36 +3022,35 @@ function WeReadPlugin:doReadReport()
         self:setReadReportError("cookie not configured", "read report skipped:", false)
         return
     end
-    local curl_payload = self.settings:get("curl_payload", {})
     local now = os.time()
     local ts = now * 1000 + math.random(0, 999)
     local rn = math.random(0, 999)
     local token = WeRead.DEFAULT_READER_TOKEN
     local payload = {
-        appId = curl_payload.appId or WeRead.web_app_id(),
+        appId = WeRead.web_app_id(),
         b = WeRead.e(report_book_id),
-        c = curl_payload.c or WeRead.e(0),
-        ci = curl_payload.ci or 27,
-        co = curl_payload.co or 389,
-        sm = curl_payload.sm or "",
-        pr = curl_payload.pr or 74,
+        c = WeRead.e(0),
+        ci = 27,
+        co = 389,
+        sm = "",
+        pr = 74,
         rt = rr.interval_seconds or 30,
         ts = ts,
         rn = rn,
         sg = Crypto.sha256_hex(tostring(ts) .. tostring(rn) .. token),
         ct = now,
-        ps = curl_payload.ps or WeRead.e(now - 1),
+        ps = WeRead.e(now - 1),
         pc = WeRead.e(now),
     }
     payload.s = WeRead.sign(WeRead.sorted_query(payload))
     local ok, result = pcall(function()
         return self.client:report_read(payload)
     end)
-    if ok and result and result.succ then
+    if ok and WeRead.is_success_response(result) then
         self:recordReadReportSuccess()
         return
     end
-    if ok and result and not result.succ then
+    if ok and not WeRead.is_success_response(result) then
         local renew_ok = pcall(function()
             self.client:renew_cookie()
         end)
@@ -3362,7 +3058,7 @@ function WeReadPlugin:doReadReport()
             local ok2, result2 = pcall(function()
                 return self.client:report_read(payload)
             end)
-            if ok2 and result2 and result2.succ then
+            if ok2 and WeRead.is_success_response(result2) then
                 self:recordReadReportSuccess()
                 return
             end

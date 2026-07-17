@@ -817,7 +817,7 @@ function Content.fetch_catalog(client, book)
     return chapters
 end
 
-function Content.fetch_chapter_shard(client, settings, book, chapter, endpoint)
+function Content.fetch_chapter_shard(client, _settings, book, chapter, endpoint)
     if not book.psvts then
         Content.ensure_reader_state(client, book)
     end
@@ -839,7 +839,6 @@ function Content.fetch_chapter_shard(client, settings, book, chapter, endpoint)
             ["Content-Type"] = "application/json;charset=UTF-8",
             ["Origin"] = "https://weread.qq.com",
             ["Referer"] = chapter_url,
-            ["Cookie"] = require("lib.cookie").to_header(settings:get("cookies", {})),
         },
         body = client:json_encode(params),
     })
