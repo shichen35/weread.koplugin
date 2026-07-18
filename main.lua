@@ -19,6 +19,7 @@ local Client = require("lib.client")
 local Content = require("lib.content")
 local EndOfBookDialog = require("ui.end_of_book_dialog")
 local I18n = require("lib.i18n")
+local Scan = require("lib.scan")
 local QRLogin = require("lib.qr_login")
 local ReadReport = require("lib.read_report")
 local ReadStats = require("lib.read_stats")
@@ -297,6 +298,12 @@ function WeReadPlugin:getSettingsMenuItems()
             sub_item_table_func = function()
                 return {
                     {
+                        text = _("Scan and match local books"),
+                        callback = self:safeCallback(_("Scan and match local books"), function()
+                            self:confirmScanLocalCache()
+                        end),
+                    },
+                    {
                         text = _("Cache cleanup"),
                         callback = self:safeCallback(_("Cache cleanup"), function()
                             self:showCacheManagement()
@@ -513,7 +520,7 @@ end
 -- as orphans (still reachable via the stored paths, but not under the new root).
 function WeReadPlugin:offerMoveBooksToNewDir(old_dir, new_dir)
     if old_dir == new_dir then
-        self:showInfo(T(_("Download directory set to:\n%1"), new_dir))
+        self:offerScanNewDir(new_dir, T(_("Download directory set to:\n%1"), new_dir))
         return
     end
     local lfs = require("libs/libkoreader-lfs")
@@ -530,7 +537,7 @@ function WeReadPlugin:offerMoveBooksToNewDir(old_dir, new_dir)
         end
     end
     if #movable == 0 then
-        self:showInfo(T(_("Download directory set to:\n%1"), new_dir))
+        self:offerScanNewDir(new_dir, T(_("Download directory set to:\n%1"), new_dir))
         return
     end
     UIManager:show(ConfirmBox:new{
@@ -541,7 +548,7 @@ function WeReadPlugin:offerMoveBooksToNewDir(old_dir, new_dir)
         end,
         cancel_text = _("Keep"),
         cancel_callback = function()
-            self:showInfo(T(_("Download directory set to:\n%1\nExisting downloads stay in the old location."), new_dir))
+            self:offerScanNewDir(new_dir, T(_("Download directory set to:\n%1\nExisting downloads stay in the old location."), new_dir))
         end,
     })
 end
@@ -576,11 +583,13 @@ function WeReadPlugin:moveBooksToNewDir(movable, new_dir)
         self.settings:set("books", books)
         self.settings:flush()
         self:closeBusy()
+        local message
         if skipped == 0 and failed == 0 then
-            self:showInfo(T(_("Moved %1 book(s) to:\n%2"), tostring(moved), new_dir))
+            message = T(_("Moved %1 book(s) to:\n%2"), tostring(moved), new_dir)
         else
-            self:showInfo(T(_("Moved %1 book(s). %2 skipped (target already exists), %3 failed. These stay in the old location."), tostring(moved), tostring(skipped), tostring(failed)))
+            message = T(_("Moved %1 book(s). %2 skipped (target already exists), %3 failed. These stay in the old location."), tostring(moved), tostring(skipped), tostring(failed))
         end
+        self:offerScanNewDir(new_dir, message)
     end)
 end
 
@@ -933,6 +942,111 @@ function WeReadPlugin:refreshCacheManagement(message)
     if message then
         self:showTransientInfo(message)
     end
+end
+
+-- Register manually copied content under a download root into the books table.
+-- Only directories whose name matches a shelf book id in `allowed` are imported
+-- (see lib/scan.lua), so unrelated folders in a user-selected download dir can
+-- never be registered and later removed by cache cleanup.
+function WeReadPlugin:scanLocalCache(root, allowed, dry_run)
+    local lfs = require("libs/libkoreader-lfs")
+    local books = self.settings:get("books", {})
+    local added, updated = Scan.scan_root({
+        root = root,
+        fs = lfs,
+        books = books,
+        allowed = allowed,
+        is_mp = WeRead.is_mp_book,
+        dry_run = dry_run,
+        now = os.time(),
+    })
+    if not dry_run then
+        self.settings:set("books", books)
+        self.settings:flush()
+    end
+    return added, updated
+end
+
+-- Build the set of importable directory names from the user's WeRead shelf.
+-- Must be called from an online context; raises on API failure.
+function WeReadPlugin:fetchShelfAllowedMap()
+    local result = self.client:gateway("/shelf/sync", {})
+    local allowed = {}
+    for _i, book in ipairs(result and result.books or {}) do
+        if book.bookId then
+            allowed[Content.book_dir_name(book.bookId)] = {
+                book_id = book.bookId,
+                title = book.title,
+                author = book.author,
+            }
+        end
+    end
+    return allowed
+end
+
+function WeReadPlugin:confirmScanLocalCache()
+    if not self.settings:is_api_configured() then
+        self:showInfo(_("Scanning requires the official API key to match folders against your WeRead shelf."))
+        return
+    end
+    self:runOnlineTask(_("Scan and match local books"), function()
+        self:showBusy(_("Scanning local cache..."))
+        local ok, allowed = pcall(function()
+            return self:fetchShelfAllowedMap()
+        end)
+        if not ok then
+            self:closeBusy()
+            logger.err(LOG_MODULE, "scan shelf fetch failed:", log_error(allowed))
+            self:showInfo(T(_("%1 failed:\n%2"), _("Scan and match local books"), display_error(allowed)))
+            return
+        end
+        local added, updated = self:scanLocalCache(self.settings.cache_dir, allowed)
+        self:closeBusy()
+        self:refreshCacheManagement(T(_("Scan complete. %1 added, %2 updated."),
+            tostring(added), tostring(updated)))
+    end)
+end
+
+-- After the download directory changes, offer to register untracked items
+-- already sitting in the new directory (e.g. manually copied in), as well as
+-- known books whose stored paths became stale and need rebinding to the files
+-- found here. base_message is shown when there is nothing to import or the user
+-- skips. Importing requires matching against the shelf, so without an API key
+-- or network the scan is silently skipped; it can be run later from Cache
+-- management.
+function WeReadPlugin:offerScanNewDir(new_dir, base_message)
+    if not self.settings:is_api_configured() or not self:isNetworkOnline() then
+        self:showInfo(base_message)
+        return
+    end
+    self:runOnlineTask(_("Scan and match local books"), function()
+        local ok, allowed = pcall(function()
+            return self:fetchShelfAllowedMap()
+        end)
+        if not ok then
+            logger.warn(LOG_MODULE, "skip scan, shelf fetch failed:", log_error(allowed))
+            self:showInfo(base_message)
+            return
+        end
+        local pending_added, pending_updated = self:scanLocalCache(new_dir, allowed, true)
+        if pending_added + pending_updated == 0 then
+            self:showInfo(base_message)
+            return
+        end
+        UIManager:show(ConfirmBox:new{
+            text = T(_("Found %1 new and %2 outdated item(s) in the new directory. Import them?"),
+                tostring(pending_added), tostring(pending_updated)),
+            ok_text = _("Import"),
+            ok_callback = function()
+                local added, updated = self:scanLocalCache(new_dir, allowed)
+                self:showInfo(T(_("Imported %1 new and %2 updated item(s)."), tostring(added), tostring(updated)))
+            end,
+            cancel_text = _("Skip"),
+            cancel_callback = function()
+                self:showInfo(base_message)
+            end,
+        })
+    end)
 end
 
 function WeReadPlugin:confirmClearBookCache(book_id, title, on_cleared)
