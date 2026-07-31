@@ -583,7 +583,7 @@ function M:offerScanNewDir(new_dir, base_message)
         self:showInfo(base_message)
         return
     end
-    self:runOnlineTask(_("Scan and match local books"), function()
+    self:scheduleNetworkTask(_("Scan and match local books"), function()
         local ok, allowed = pcall(function()
             return self:fetchShelfAllowedMap()
         end)

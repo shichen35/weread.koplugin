@@ -129,6 +129,7 @@ package.preload["weread.ui.common"] = function()
         requireLogin = function() return true end,
         runOnlineTask = function(_self, _label, fn) return fn() end,
         runConnectedTask = function(_self, _label, fn) return fn() end,
+        scheduleNetworkTask = function(_self, _label, fn) return fn() end,
         isNetworkConnected = function() return true end,
     }
 end

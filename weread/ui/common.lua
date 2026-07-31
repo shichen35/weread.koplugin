@@ -121,7 +121,7 @@ function M:showOffline(label)
     self:showInfo(T(_("%1 failed:\n%2"), label, _("No network connection. Please connect Wi-Fi and try again.")))
 end
 
-local function schedule_network_task(self, label, callback, delay)
+function M:scheduleNetworkTask(label, callback, delay)
     UIManager:scheduleIn(delay or 0.1, function()
         local ok, err = xpcall(callback, debug.traceback)
         if not ok then
@@ -138,7 +138,7 @@ function M:runOnlineTask(label, callback, delay)
         self:showOffline(label)
         return false
     end
-    return schedule_network_task(self, label, callback, delay)
+    return self:scheduleNetworkTask(label, callback, delay)
 end
 
 function M:runConnectedTask(label, callback, delay)
@@ -146,7 +146,7 @@ function M:runConnectedTask(label, callback, delay)
         self:showOffline(label)
         return false
     end
-    return schedule_network_task(self, label, callback, delay)
+    return self:scheduleNetworkTask(label, callback, delay)
 end
 
 function M:runNetworkAction(label, action)
