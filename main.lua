@@ -87,7 +87,7 @@ function WeReadPlugin:init()
             return self:getChapterInfoFromFile(book, path)
         end,
         run_online = function(_kind, callback)
-            return self:runOnlineTask(_("Sync progress"), callback)
+            return self:runConnectedTask(_("Sync progress"), callback)
         end,
         upload_position = function(book_id, position, elapsed_seconds)
             return self.read_report:upload_position(

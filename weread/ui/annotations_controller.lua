@@ -775,7 +775,7 @@ function M:_downloadMissingThought(info, href, link, tap_started)
         end
     end
 
-    local scheduled = self:runOnlineTask(label, function()
+    local scheduled = self:runConnectedTask(label, function()
         if not request_is_current() then
             finish_request()
             return
