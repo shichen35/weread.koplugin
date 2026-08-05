@@ -87,6 +87,8 @@ local settings = Settings:new()
 
 expect(settings.data_dir == "/data/weread", "data directory was wrong")
 expect(settings.cache_dir == "/data/weread/cache", "default cache directory was wrong")
+expect(settings:get("update").prefer_proxy == true,
+    "update proxy should be preferred by default")
 expect(created_dirs[1] == "/data/weread"
     and created_dirs[2] == "/data/weread/cache",
     "settings directories were not initialized")
@@ -100,6 +102,8 @@ expect(values.books["42"].cache_dir == "/cache/42",
 expect(values.config_loaded == nil, "legacy setting was not removed")
 expect(values.cache.download_book_images == false
     and values.cache.download_mp_images == false
+    and values.cache.auto_prefetch_next_chapter == false
+    and values.cache.show_prefetch_notifications == true
     and values.cache.show_annotations == true
     and values.cache.download_images == nil,
     "legacy cache preferences were not migrated")

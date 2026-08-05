@@ -67,6 +67,8 @@ local fake_settings = {
 local migrations_ran = false
 local dispatcher_registered = false
 local menu_registered = false
+local bookshelf_opened = false
+local backup_cleaned = false
 
 package.preload["weread.lib.client"] = function()
     return { new = function(_self, settings) return { settings = settings } end }
@@ -76,6 +78,25 @@ package.preload["weread.lib.downloader"] = function()
 end
 package.preload["weread.lib.settings"] = function()
     return { new = function() return fake_settings end }
+end
+package.preload["weread.lib.updater"] = function()
+    return {
+        new = function(_self, options)
+            options.cleanup_backup = function()
+                backup_cleaned = true
+                return true
+            end
+            return options
+        end,
+    }
+end
+package.preload["weread.ui.updater"] = function()
+    return {
+        new = function(_self, options)
+            options.schedule_auto_check = function() end
+            return options
+        end,
+    }
 end
 package.preload["weread.lib.migrations"] = function()
     return {
@@ -149,6 +170,10 @@ end
 package.preload["weread.ui.library"] = function()
     return {
         ensureChaptersLoaded = function() return {} end,
+        showBookshelf = function()
+            bookshelf_opened = true
+            return true
+        end,
     }
 end
 package.preload["weread.ui.annotations_controller"] = function()
@@ -187,6 +212,12 @@ expect(plugin.qr_login.kind == "qr_login", "QR login service was not initialized
 expect(migrations_ran, "migrations did not run during initialization")
 expect(dispatcher_registered, "dispatcher actions were not registered")
 expect(menu_registered, "plugin was not registered in KOReader's main menu")
+expect(backup_cleaned,
+    "successful plugin initialization did not clean the update backup")
+expect(plugin:launch() == true and bookshelf_opened,
+    "standard third-party launcher entry did not open the bookshelf")
+expect(type(plugin.openBookshelf) == "function",
+    "stable bookshelf entry point was not exposed")
 expect(package.loaded["weread.lib.client"] ~= nil,
     "namespaced client module was not loaded")
 expect(package.loaded["weread.ui.menu"] ~= nil,

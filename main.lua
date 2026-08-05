@@ -4,7 +4,10 @@ local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 
 local Client = require("weread.lib.client")
+local Content = require("weread.lib.content")
 local Downloader = require("weread.lib.downloader")
+local Integrations = require("integrations.init")
+local LibraryDB = require("weread.lib.library_db")
 local Mixin = require("weread.lib.mixin")
 local Migrations = require("weread.lib.migrations")
 local PluginUtil = require("weread.lib.plugin_util")
@@ -13,18 +16,50 @@ local ProgressSyncDialog = require("weread.ui.progress_sync_dialog")
 local QRLogin = require("weread.lib.qr_login")
 local ReadReport = require("weread.lib.read_report")
 local Settings = require("weread.lib.settings")
+local Updater = require("weread.lib.updater")
+local UpdaterUI = require("weread.ui.updater")
 
 local _ = PluginUtil.tr
 
 local WeReadPlugin = WidgetContainer:extend{
     name = "weread",
     is_doc_only = false,
-    version = "0.1.1",
+    version = "1.0.0",
 }
+
+-- Stable entry point used by third-party launchers such as SimpleUI and ZenUI.
+function WeReadPlugin:openBookshelf()
+    return self:showBookshelf()
+end
+
+-- Both SimpleUI and ZenUI discover conventional plugin launch methods.
+function WeReadPlugin:launch()
+    return self:openBookshelf()
+end
+
+function WeReadPlugin:onZenUIReady()
+    Integrations.onZenUIReady(self)
+    return true
+end
 
 function WeReadPlugin:init()
     math.randomseed(os.time())
     self.settings = Settings:new()
+    self.library_db = LibraryDB:new(self.settings)
+    local updater = Updater:new{
+        settings = self.settings,
+        current_version = self.version,
+    }
+    self.updater = UpdaterUI:new{
+        updater = updater,
+        settings = self.settings,
+        is_connected = function()
+            return self:isNetworkConnected()
+        end,
+        refresh_ui = function()
+            self:refreshUI()
+        end,
+    }
     self.client = Client:new(self.settings)
     self.downloader = Downloader:new{
         client = self.client,
@@ -39,12 +74,20 @@ function WeReadPlugin:init()
         run_online_task = function(label, fn)
             return self:runOnlineTask(label, fn)
         end,
+        run_background_task = function(fn)
+            UIManager:scheduleIn(0.1, fn)
+            return true
+        end,
+        is_connected = function()
+            return self:isNetworkConnected()
+        end,
     }
     Migrations.run(self.settings, self.client)
     self.qr_login = QRLogin:new(self, self.client, self.settings)
     self.read_report = ReadReport:new{
         settings = self.settings,
         client = self.client,
+        library_db = self.library_db,
         scheduler = UIManager,
         get_document = function()
             return self.ui and self.ui.document
@@ -82,6 +125,33 @@ function WeReadPlugin:init()
         end,
         get_chapters = function(book)
             return self:ensureChaptersLoaded(book)
+        end,
+        refresh_catalog = function(book_id)
+            local book = self.settings:get("books", {})[tostring(book_id)]
+            if type(book) ~= "table" then
+                return nil, "book_not_found"
+            end
+            local ok, chapters_or_err = pcall(function()
+                Content.ensure_reader_state(self.client, book)
+                return Content.fetch_catalog(self.client, book)
+            end)
+            if not ok then
+                return nil, chapters_or_err
+            end
+            local chapters = chapters_or_err
+            if type(chapters) ~= "table" or #chapters == 0 then
+                return nil, "catalog_unavailable"
+            end
+            local cache_ok, cache_err = Content.save_catalog_cache(
+                self.client, self.settings, book, chapters)
+            if not cache_ok then
+                logger.warn("save chapter catalog cache failed:",
+                    PluginUtil.log_error(cache_err))
+            end
+            if self.library_db then
+                self.library_db:putChapters(book_id, chapters)
+            end
+            return chapters
         end,
         get_file_context = function(book, path)
             return self:getChapterInfoFromFile(book, path)
@@ -123,6 +193,8 @@ function WeReadPlugin:init()
     }
     self:onDispatcherRegisterActions()
     self.ui.menu:registerToMainMenu(self)
+    self.integrations = Integrations
+    self.integrations.register(self)
     local read_report = self.settings:get("read_report")
     if read_report.enabled
         and read_report.mode == "manual"
@@ -131,7 +203,9 @@ function WeReadPlugin:init()
         self.read_report:maybe_start("plugin_start")
     end
     self._reader_session_gen = 0
+    self.updater:schedule_auto_check()
     logger.info("initialized:", "version=", self.version)
+    updater:cleanup_backup()
 end
 
 Mixin.apply(WeReadPlugin, {
